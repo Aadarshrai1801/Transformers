@@ -86,6 +86,5 @@ def main():
     for key, value in results.items():
         print(f"{key}: {value:.4f}")
 
-
 if __name__ == "__main__":
     main()
