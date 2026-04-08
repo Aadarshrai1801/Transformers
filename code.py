@@ -1,6 +1,6 @@
 import torch
-from datasets import load_dataset
-from transformers import (
+from datasets import load_dataset #type: ignore
+from transformers import ( #type: ignore
     AutoTokenizer,
     AutoModelForSequenceClassification,
     Trainer,
