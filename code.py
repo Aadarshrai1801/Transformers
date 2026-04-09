@@ -1,90 +1,180 @@
 import torch
-from datasets import load_dataset #type: ignore
-from transformers import ( #type: ignore
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    Trainer,
-    TrainingArguments
-)
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import torch.nn as nn
+import math
 
+# ==============================
+# Positional Encoding
+# ==============================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
 
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = torch.argmax(torch.tensor(logits), dim=1)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
 
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        labels, predictions, average='binary'
-    )
-    acc = accuracy_score(labels, predictions)
-
-    return {
-        "accuracy": acc,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall
-    }
-
-
-def main():
-    print("Loading dataset...")
-    dataset = load_dataset("imdb")
-
-    print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-
-    def tokenize(example):
-        return tokenizer(
-            example["text"],
-            truncation=True,
-            padding="max_length",
-            max_length=256
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() *
+            (-math.log(10000.0) / d_model)
         )
 
-    print("Tokenizing dataset...")
-    dataset = dataset.map(tokenize, batched=True)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
 
-    dataset = dataset.rename_column("label", "labels")
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+        self.pe = pe.unsqueeze(0)  # shape: (1, max_len, d_model)
 
-    train_dataset = dataset["train"].shuffle(seed=42).select(range(2000))
-    test_dataset = dataset["test"].shuffle(seed=42).select(range(500))
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)].to(x.device)
 
-    print("Loading model...")
-    model = AutoModelForSequenceClassification.from_pretrained(
-        "bert-base-uncased",
-        num_labels=2
-    )
 
-    training_args = TrainingArguments(
-        output_dir="./results",
-        learning_rate=2e-5,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        num_train_epochs=2,
-        weight_decay=0.01,
-        evaluation_strategy="epoch",
-        logging_dir="./logs",
-        save_strategy="epoch"
-    )
+# ==============================
+# Multi-Head Attention
+# ==============================
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super(MultiHeadAttention, self).__init__()
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        compute_metrics=compute_metrics
-    )
+        assert d_model % num_heads == 0
 
-    print("Training started...")
-    trainer.train()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.depth = d_model // num_heads
 
-    print("Evaluating model...")
-    results = trainer.evaluate()
+        self.wq = nn.Linear(d_model, d_model)
+        self.wk = nn.Linear(d_model, d_model)
+        self.wv = nn.Linear(d_model, d_model)
 
-    print("\nFinal Results:")
-    for key, value in results.items():
-        print(f"{key}: {value:.4f}")
+        self.fc_out = nn.Linear(d_model, d_model)
 
+    def split_heads(self, x, batch_size):
+        x = x.view(batch_size, -1, self.num_heads, self.depth)
+        return x.transpose(1, 2)
+
+    def forward(self, q, k, v, mask=None):
+        batch_size = q.size(0)
+
+        Q = self.split_heads(self.wq(q), batch_size)
+        K = self.split_heads(self.wk(k), batch_size)
+        V = self.split_heads(self.wv(v), batch_size)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.depth)
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+
+        attention = torch.softmax(scores, dim=-1)
+
+        out = torch.matmul(attention, V)
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(batch_size, -1, self.d_model)
+
+        return self.fc_out(out)
+
+
+# ==============================
+# Feed Forward Network
+# ==============================
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super(FeedForward, self).__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
+
+
+# ==============================
+# Transformer Encoder Layer
+# ==============================
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+        super(EncoderLayer, self).__init__()
+
+        self.attn = MultiHeadAttention(d_model, num_heads)
+        self.ffn = FeedForward(d_model, d_ff)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        attn_out = self.attn(x, x, x, mask)
+        x = self.norm1(x + self.dropout(attn_out))
+
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.dropout(ffn_out))
+
+        return x
+
+
+# ==============================
+# Transformer Encoder
+# ==============================
+class TransformerEncoder(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff, max_len):
+        super(TransformerEncoder, self).__init__()
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoding = PositionalEncoding(d_model, max_len)
+
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, d_ff)
+            for _ in range(num_layers)
+        ])
+
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x, mask=None):
+        x = self.embedding(x)
+        x = self.pos_encoding(x)
+        x = self.dropout(x)
+
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        return x
+
+
+# ==============================
+# Classification Head
+# ==============================
+class TransformerClassifier(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, d_ff, max_len, num_classes):
+        super(TransformerClassifier, self).__init__()
+
+        self.encoder = TransformerEncoder(
+            vocab_size, d_model, num_heads, num_layers, d_ff, max_len
+        )
+
+        self.fc = nn.Linear(d_model, num_classes)
+
+    def forward(self, x):
+        enc_out = self.encoder(x)
+        pooled = enc_out[:, 0, :]  # CLS token representation
+        return self.fc(pooled)
+
+
+# ==============================
+# Example Usage
+# ==============================
 if __name__ == "__main__":
-    main()
+    vocab_size = 10000
+    max_len = 50
+    d_model = 128
+    num_heads = 8
+    num_layers = 2
+    d_ff = 512
+    num_classes = 2
+
+    model = TransformerClassifier(
+        vocab_size, d_model, num_heads,
+        num_layers, d_ff, max_len, num_classes
+    )
+
+    sample_input = torch.randint(0, vocab_size, (32, max_len))  # batch=32
+
+    output = model(sample_input)
+
+    print("Output shape:", output.shape)
