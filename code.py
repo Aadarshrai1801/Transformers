@@ -69,7 +69,6 @@ class MultiHeadAttention(nn.Module):
 
         return self.fc_out(out)
 
-
 # ==============================
 # Feed Forward Network
 # ==============================
@@ -82,7 +81,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.fc2(self.relu(self.fc1(x)))
-
 
 # ==============================
 # Transformer Encoder Layer
@@ -107,7 +105,6 @@ class EncoderLayer(nn.Module):
         x = self.norm2(x + self.dropout(ffn_out))
 
         return x
-
 
 # ==============================
 # Transformer Encoder
@@ -135,7 +132,6 @@ class TransformerEncoder(nn.Module):
             x = layer(x, mask)
 
         return x
-
 
 # ==============================
 # Classification Head
